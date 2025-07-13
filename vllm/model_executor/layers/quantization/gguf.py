@@ -9,6 +9,7 @@ from gguf import GGMLQuantizationType as WeightType
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,
                                                         FusedMoEMethodBase)
@@ -89,6 +90,9 @@ IMATRIX_QUANT_TYPES = {
     WeightType.IQ4_XS,
     WeightType.IQ4_NL,
 }
+MI50_CUSTOM_KERNEL_SUPPORTED_QUANT_TYPES = {
+    WeightType.Q8_0,
+}
 # TODO(Isotr0py): Currently, we don't have MMQ kernel for I-Matrix quantization.
 # Consolidate DEQUANT_TYPES, MMVQ_QUANT_TYPES and MMQ_QUANT_TYPES after we add
 # MMQ kernel for I-Matrix quantization.
@@ -109,8 +113,11 @@ def _fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor,
     # there is no need to call any kernel for fp16/bf16
     if qweight_type in UNQUANTIZED_TYPES:
         return x @ qweight.T
+    # use mi50 custom q8_0 kernel if possible. this kernel is slower when batch < 4 so only use this when batch > 4
+    if envs.VLLM_USE_MI50_CUSTOM_GGUF_MUL_MAT_KERNEL and qweight_type in MI50_CUSTOM_KERNEL_SUPPORTED_QUANT_TYPES and x.shape[0] > 4:
+        y = ops.ggml_mul_mat_a8_q8_0_mi50(qweight, x)
     # enable MMVQ in contiguous batching with batch_size<=8
-    if x.shape[0] <= 8 and qweight_type in MMVQ_QUANT_TYPES:
+    elif x.shape[0] <= 8 and qweight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
     # Use MMQ Kernel if it's available (standard + k-quants)
     elif qweight_type in MMQ_QUANT_TYPES:

@@ -1415,6 +1415,13 @@ def ggml_mul_mat_a8(
     return torch.ops._C.ggml_mul_mat_a8(W, X, quant_type, row)
 
 
+def ggml_mul_mat_a8_q8_0_mi50(
+    W: torch.Tensor,
+    X: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops._C.ggml_mul_mat_a8_q8_0_mi50(W, X)
+
+
 def ggml_moe_a8(
     X: torch.Tensor,
     W: torch.Tensor,

@@ -249,6 +249,7 @@ set(VLLM_EXT_SRC
   "csrc/quantization/fp8/common.cu"
   "csrc/quantization/fused_kernels/fused_layernorm_dynamic_per_token_quant.cu"
   "csrc/quantization/gguf/gguf_kernel.cu"
+  "csrc/quantization/gguf/gguf_kernel_mi50.cu"
   "csrc/quantization/activation_kernels.cu"
   "csrc/cuda_utils_kernels.cu"
   "csrc/prepare_inputs/advance_step.cu"
@@ -637,6 +638,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   endif()
 # if CUDA endif
 endif()
+
+# enable warp shuffle for rocm
+list(APPEND VLLM_GPU_FLAGS "-DHIP_ENABLE_WARP_SYNC_BUILTINS")
 
 message(STATUS "Enabling C extension.")
 define_gpu_extension_target(
