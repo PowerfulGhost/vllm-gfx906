@@ -16,6 +16,7 @@ from vllm.entrypoints.openai.protocol import (
     ModelPermission,
     UnloadLoRAAdapterRequest,
 )
+from vllm.entrypoints.utils import sanitize_message
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.lora.resolver import LoRAResolver, LoRAResolverRegistry
@@ -119,7 +120,7 @@ class OpenAIServingModels:
         lora_cards = [
             ModelCard(
                 id=lora.lora_name,
-                root=lora.local_path,
+                root=lora.path,
                 parent=lora.base_model_name
                 if lora.base_model_name
                 else self.base_model_paths[0].name,
@@ -300,5 +301,9 @@ def create_error_response(
     status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
 ) -> ErrorResponse:
     return ErrorResponse(
-        error=ErrorInfo(message=message, type=err_type, code=status_code.value)
+        error=ErrorInfo(
+            message=sanitize_message(message),
+            type=err_type,
+            code=status_code.value,
+        )
     )

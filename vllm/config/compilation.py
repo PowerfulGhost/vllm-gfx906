@@ -32,6 +32,9 @@ else:
 
 logger = init_logger(__name__)
 
+# Explicitly exports Range
+__all__ = ["Range"]
+
 
 class CompilationMode(enum.IntEnum):
     """The compilation approach used for torch.compile-based compilation of the
@@ -275,7 +278,11 @@ class DynamicShapesConfig:
     artifacts also.
     When type is backed, aot_compile must be disabled for this mode to work.
     until this change picked up https://github.com/pytorch/pytorch/pull/169239.
+    """
 
+    assume_32_bit_indexing: bool = True
+    """
+    whether all tensor sizes can use 32 bit indexing.
     """
 
     def compute_hash(self) -> str:
@@ -404,7 +411,8 @@ class CompilationConfig:
     - 'none,+op1,+op2' to enable only op1 and op2
 
     By default, all custom ops are enabled when running without Inductor and
-    disabled when running with Inductor: mode>=VLLM_COMPILE and backend="inductor".
+    disabled when running with Inductor: mode>CompilationMode.NONE and
+    backend="inductor".
     Inductor generates (fused) Triton kernels for disabled custom ops."""
     splitting_ops: list[str] | None = None
     """A list of ops to exclude from cudagraphs, used in piecewise compilation.
@@ -426,8 +434,9 @@ class CompilationConfig:
     If empty list [], no ops are excluded (suitable for full cudagraphs)."""
     compile_mm_encoder: bool = False
     """Whether or not to compile the multimodal encoder.
-    Currently, this only works for `Qwen2_5_vl` on selected platforms.
-    Disabled by default until more models are supported/tested to work."""
+    Currently, this only works for `Qwen2_5_vl` and `mLLaMa4` models
+    on selected platforms. Disabled by default until more models
+    are supported/tested to work."""
 
     # Inductor capture
     compile_sizes: list[int | str] | None = None
@@ -437,14 +446,14 @@ class CompilationConfig:
 
     compile_ranges_split_points: list[int] | None = None
     """Split points that represent compile ranges for inductor.
-    The compile ranges are 
-    [1, split_points[0]], 
-    [split_points[0] + 1, split_points[1]], ..., 
+    The compile ranges are
+    [1, split_points[0]],
+    [split_points[0] + 1, split_points[1]], ...,
     [split_points[-1] + 1, max_num_batched_tokens].
     Compile sizes are also used single element ranges,
     the range is represented as [compile_sizes[i], compile_sizes[i]].
-    
-    If a range overlaps with the compile size, graph for compile size 
+
+    If a range overlaps with the compile size, graph for compile size
     will be prioritized, i.e. if we have a range [1, 8] and a compile size 4,
     graph for compile size 4 will be compiled and used instead of the graph
     for range [1, 8].
@@ -635,6 +644,7 @@ class CompilationConfig:
             "compilation_time",
             "static_forward_context",
             "pass_config",  # handled separately below
+            "dynamic_shapes_config",  # handled separately below
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
@@ -642,6 +652,7 @@ class CompilationConfig:
         factors = get_hash_factors(self, ignored_factors)
 
         factors["pass_config"] = self.pass_config.compute_hash()
+        factors["dynamic_shapes_config"] = self.dynamic_shapes_config.compute_hash()
         return hash_factors(factors)
 
     def __repr__(self) -> str:
@@ -839,9 +850,9 @@ class CompilationConfig:
         """
         if self.mode is None:
             raise ValueError(
-                "No compilation mode is set. This method should only be \
-                called via vllm config where the level is set if none is \
-                provided."
+                "No compilation mode is set. This method should only be "
+                "called via vllm config where the level is set if none is "
+                "provided."
             )
         if self.mode == CompilationMode.NONE:
             raise ValueError("No compilation mode is set.")
@@ -899,7 +910,7 @@ class CompilationConfig:
         self.compute_bs_to_padded_graph_size()
 
     def set_splitting_ops_for_v1(
-        self, all2all_backend: str | None = None, data_parallel_size: int | None = None
+        self, all2all_backend: str, data_parallel_size: int = 1
     ):
         # To compatible with OOT hardware plugin platform (for example vllm-ascend)
         # which currently only supports sequence parallelism in eager mode.
@@ -934,12 +945,12 @@ class CompilationConfig:
                     or self.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
                 ):
                     logger.warning_once(
-                        "Using piecewise compilation with empty splitting_ops"
+                        "Using piecewise cudagraph with empty splitting_ops"
                     )
                 if self.cudagraph_mode == CUDAGraphMode.PIECEWISE:
                     logger.warning_once(
-                        "Piecewise compilation with empty splitting_ops do not"
-                        "contains piecewise cudagraph. Setting cudagraph_"
+                        "Piecewise compilation with empty splitting_ops does not "
+                        "contain piecewise cudagraph. Setting cudagraph_"
                         "mode to NONE. Hint: If you are using attention "
                         "backends that support cudagraph, consider manually "
                         "setting cudagraph_mode to FULL or FULL_DECODE_ONLY "
@@ -948,19 +959,17 @@ class CompilationConfig:
                     self.cudagraph_mode = CUDAGraphMode.NONE
                 elif self.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE:
                     logger.warning_once(
-                        "Piecewise compilation with empty splitting_ops do "
-                        "not contains piecewise cudagraph. Setting "
+                        "Piecewise compilation with empty splitting_ops does "
+                        "not contain piecewise cudagraph. Setting "
                         "cudagraph_mode to FULL."
                     )
                     self.cudagraph_mode = CUDAGraphMode.FULL
                 self.splitting_ops = []
 
         # Disable CUDA graphs for DeepEP high-throughput since its not CG compatible
-        backend = all2all_backend or envs.VLLM_ALL2ALL_BACKEND
-        dp_size = data_parallel_size if data_parallel_size is not None else 1
         if (
-            backend == "deepep_high_throughput"
-            and dp_size > 1
+            all2all_backend == "deepep_high_throughput"
+            and data_parallel_size > 1
             and self.cudagraph_mode != CUDAGraphMode.NONE
         ):
             # TODO: Piecewise Cuda graph might be enabled
