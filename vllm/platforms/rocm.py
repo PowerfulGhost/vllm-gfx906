@@ -117,6 +117,7 @@ def _query_gcn_arch_from_amdsmi() -> str:
         # e.g., 'gfx942' for MI300X/MI325X
         target_gfx = asic_info.get("target_graphics_version", "")
         if target_gfx:
+            if target_gfx == "gfx9006": return "gfx906"  # gfx906: fix of amdsmi bug
             return target_gfx
     raise RuntimeError("amdsmi did not return valid GCN arch")
 
