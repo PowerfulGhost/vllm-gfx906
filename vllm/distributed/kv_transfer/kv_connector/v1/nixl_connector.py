@@ -14,7 +14,7 @@ from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import msgspec
 import numpy as np
@@ -298,18 +298,38 @@ class NixlConnectorMetadata(KVConnectorMetadata):
 
 
 class NixlConnector(KVConnectorBase_V1):
+    @property
+    def prefer_cross_layer_blocks(self) -> bool:
+        backend = get_current_attn_backend(self._vllm_config)
+        if backend.get_name() not in (
+            "FLASH_ATTN",
+            "FLASHINFER",
+        ):
+            return False
+
+        # For now there is no benefit to run cross layers when backend
+        # does not support on HND
+        if get_kv_cache_layout() != "HND":
+            return False
+
+        extra_config = self.kv_transfer_config.kv_connector_extra_config
+        return (
+            str(extra_config.get("enable_cross_layers_blocks", "False")).lower()
+            == "true"
+        )
+
     def __init__(
         self,
         vllm_config: VllmConfig,
         role: KVConnectorRole,
-        kv_cache_config: Optional["KVCacheConfig"] = None,
+        kv_cache_config: "KVCacheConfig | None" = None,
     ):
         super().__init__(vllm_config, role, kv_cache_config)
 
         assert vllm_config.kv_transfer_config is not None
         assert vllm_config.kv_transfer_config.engine_id is not None
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
-
+        self.kv_transfer_config = vllm_config.kv_transfer_config
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: NixlConnectorScheduler | None = (
                 NixlConnectorScheduler(vllm_config, self.engine_id)
@@ -1322,8 +1342,10 @@ class NixlConnectorWorker:
                 if base_addr in seen_base_addresses:
                     continue
 
-                kernel_block_size = cache.shape[block_size_position]
-
+                logger.debug(
+                    "Registering layer %s with cache shape: %s", layer_name, cache.shape
+                )
+                kernel_block_size = cache.shape[self.kv_topo.block_size_position]
                 if self.block_size != kernel_block_size:
                     logger.info_once(
                         "User-specified logical block size (%s) does not match"
@@ -1701,6 +1723,7 @@ class NixlConnectorWorker:
         remote_engine_id = nixl_agent_meta.engine_id
 
         assert self._tp_size[remote_engine_id] == remote_tp_size
+        assert self.kv_topo is not None
 
         tp_ratio = self.kv_topo.tp_ratio_from_engine_id(remote_engine_id)
         block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(
@@ -2182,6 +2205,7 @@ class NixlConnectorWorker:
         Post a READ point-to-point xfer request from a single local worker to
         a single remote worker.
         """
+        assert self.kv_topo is not None
         block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(dst_engine_id)
         if block_size_ratio > 1:
             local_block_ids = self.get_mapped_blocks(
@@ -2279,15 +2303,15 @@ class NixlConnectorWorker:
 
                 # Get descs ids for the layer.
                 layer_local_desc_ids = self._get_block_descs_ids(
-                    dst_engine_id,
+                    self.engine_id,
                     layer_local_block_ids,
                     layer_idx,
+                    block_size_ratio=block_size_ratio,
                 )
                 layer_remote_desc_ids = self._get_block_descs_ids(
-                    self.engine_id,
+                    dst_engine_id,
                     layer_remote_block_ids,
                     layer_idx,
-                    block_size_ratio=block_size_ratio,
                 )
 
                 local_descs_list.append(layer_local_desc_ids)

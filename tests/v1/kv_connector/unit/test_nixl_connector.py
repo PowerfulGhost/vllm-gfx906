@@ -46,6 +46,7 @@ from vllm.platforms import current_platform
 from vllm.platforms.interface import Platform
 from vllm.sampling_params import SamplingParams
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+from vllm.v1.attention.backends.utils import set_kv_cache_layout
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
@@ -1352,6 +1353,7 @@ def _run_abort_timeout_test(llm: LLM, timeout: int):
     llm.llm_engine.engine_core.shutdown()
 
 
+@pytest.mark.parametrize("enable_cross_layers", ["False", "True"])
 @pytest.mark.parametrize(
     "attn_backend",
     [
@@ -1372,7 +1374,9 @@ def _run_abort_timeout_test(llm: LLM, timeout: int):
         "TRITON_ATTN",
     ],
 )
-def test_register_kv_caches(default_vllm_config, dist_init, attn_backend):
+def test_register_kv_caches(
+    default_vllm_config, dist_init, attn_backend, enable_cross_layers
+):
     """
     Test that register_kv_caches() properly calls nixl_wrapper methods with
     correct data.
@@ -1385,6 +1389,12 @@ def test_register_kv_caches(default_vllm_config, dist_init, attn_backend):
     """
 
     vllm_config = create_vllm_config(attention_backend=attn_backend)
+
+    # Enable cross layers blocks
+    vllm_config.kv_transfer_config.kv_connector_extra_config[
+        "enable_cross_layers_blocks"
+    ] = enable_cross_layers
+    set_kv_cache_layout("HND")
 
     # Import the appropriate backend based on the parameter
     if attn_backend == "FLASH_ATTN":
@@ -1466,6 +1476,111 @@ def test_register_kv_caches(default_vllm_config, dist_init, attn_backend):
         # Reassure the shutdown() check that the thread is terminated
         mock_thread.return_value.is_alive.return_value = False
 
+        expected_tensor_size: int
+        expected_base_addrs: list[int]
+        expected_num_entries: int
+        kv_caches: dict[str, torch.Tensor]
+        assert str(enable_cross_layers).lower() != "true" or (
+            (attn_backend not in ("FLASH_ATTN", "FLASHINFER"))
+            or connector.prefer_cross_layer_blocks
+        )
+        if connector.prefer_cross_layer_blocks:
+            num_layers = 32
+            block_size = 16
+            num_blocks = 8
+            kv_cache_spec = AttentionSpec(
+                block_size=block_size,
+                num_kv_heads=4,
+                head_size=64,
+                dtype=torch.bfloat16,
+            )
+            kv_cache_config = KVCacheConfig(
+                num_blocks=num_blocks,
+                kv_cache_tensors=[
+                    KVCacheTensor(
+                        size=kv_cache_spec.page_size_bytes * num_blocks,
+                        shared_by=["dummy-layer"],
+                    )
+                    for i in range(num_layers)
+                ],
+                # allocate_uniform_kv_caches does not use this
+                kv_cache_groups=[],
+            )
+
+            with set_current_vllm_config(vllm_config):
+                _, cross_layers_kv_cache, _ = (
+                    KVConnectorModelRunnerMixin.allocate_uniform_kv_caches(
+                        kv_cache_config=kv_cache_config,
+                        attn_groups=[
+                            [
+                                AttentionGroup(
+                                    backend=backend_cls,
+                                    layer_names=[],
+                                    kv_cache_spec=kv_cache_spec,
+                                    kv_cache_group_id=0,
+                                )
+                            ]
+                        ],
+                        cache_dtype=torch.bfloat16,
+                        device=torch.cuda.current_device(),
+                        kernel_block_sizes=[block_size],
+                    )
+                )
+            # Store tensor info for validation
+            expected_tensor_size = (
+                cross_layers_kv_cache.element_size() * cross_layers_kv_cache.numel()
+            )
+            expected_base_addrs = [
+                cross_layers_kv_cache.data_ptr(),
+            ]
+            expected_num_entries = 1
+
+            expected_blocks_count = 8
+
+            kv_caches = {"all-layers": cross_layers_kv_cache}
+
+        else:
+            # Create test kv cache tensors using proper backend shape
+            kv_cache_shape = backend_cls.get_kv_cache_shape(
+                num_blocks=2, block_size=16, num_kv_heads=4, head_size=64
+            )
+            shared_tensor = torch.zeros(*kv_cache_shape, dtype=torch.float16)
+            unique_tensor = torch.zeros(*kv_cache_shape, dtype=torch.float16)
+            kv_caches = {
+                "layer0": shared_tensor,
+                "layer1": unique_tensor,
+                "layer2": shared_tensor,
+            }
+
+            # Store tensor info for validation
+
+            test_shape = backend_cls.get_kv_cache_shape(
+                num_blocks=1, block_size=16, num_kv_heads=1, head_size=1
+            )
+            is_blocks_first = len(test_shape) == 5 and test_shape[0] == 1
+
+            if is_blocks_first:
+                expected_tensor_size = (
+                    shared_tensor.element_size() * shared_tensor.numel()
+                )
+                expected_base_addrs = [
+                    shared_tensor.data_ptr(),
+                    unique_tensor.data_ptr(),
+                ]
+                expected_num_entries = 2
+            else:
+                expected_tensor_size = (
+                    shared_tensor[0].element_size() * shared_tensor[0].numel()
+                )
+                expected_base_addrs = [
+                    shared_tensor[0].data_ptr(),
+                    shared_tensor[1].data_ptr(),
+                    unique_tensor[0].data_ptr(),
+                    unique_tensor[1].data_ptr(),
+                ]
+                expected_num_entries = 4
+            expected_blocks_count = 8
+
         # Execute register_kv_caches
         connector.register_kv_caches(kv_caches)
 
@@ -1506,6 +1621,8 @@ def test_register_kv_caches(default_vllm_config, dist_init, attn_backend):
                 f"Block entry {i}: Expected block len {expected_block_len}, "
                 f"got {block_len}"
             )
+
+        assert connector.connector_worker.block_size == 16
 
 
 class FakePlatform(Platform):
