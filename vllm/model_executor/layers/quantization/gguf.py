@@ -504,13 +504,19 @@ class GGUFLinearMethod(LinearMethodBase):
             )
             # (dim0_start, dim0_end, dim1_size)
             shard_offset_map = dict[str, tuple[int, int, int]]()
-            for idx in shard_id:
+            # Ensure QKV weights are in correct order during creation
+            target_order = ["q", "k", "v"] if "q" in shard_id else shard_id
+            qweight.shard_id = target_order
+            current_offset = 0
+            for idx in target_order:
                 id_in_container = shard_id_map[idx]
-                start = sum(x.size(0) for x in data_container[:id_in_container])
-                end = start + data_container[id_in_container].size(0)
-                size = data_container[id_in_container].size(1)
-                padded_data[start:end, :size] = data_container[id_in_container]
+                data = data_container[id_in_container]
+                start = current_offset
+                end = start + data.size(0)
+                size = data.size(1)
+                padded_data[start:end, :size] = data
                 shard_offset_map[idx] = (start, end, size)
+                current_offset = end
             qweight.data_container.clear()
             padded_param = Parameter(padded_data, requires_grad=False)
             set_weight_attrs(padded_param, vars(qweight))
@@ -526,23 +532,60 @@ class GGUFLinearMethod(LinearMethodBase):
         shard_id = layer.qweight.shard_id
 
         if shard_id:
-            # dequantize shard weights respectively
-            shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
             qweight = layer.qweight
-            result = []
+            
+            # Group contiguous shards with same type and offset
+            groups = []
+            current_group = []
+            prev_end = None
+            prev_type = None
+            prev_offset = None
+
             for idx in shard_id:
                 start, end, offset = layer.qweight.shard_offset_map[idx]
                 qweight_type = layer.qweight_type.shard_weight_type[idx]
-                result.append(
-                    fused_mul_mat_gguf(
-                        x, qweight[start:end, :offset].contiguous(), qweight_type
-                    )
+
+                # Check if we can merge with the previous shard
+                can_merge = (
+                    current_group and 
+                    prev_end == start and             # Memory contiguous
+                    prev_type == qweight_type and     # Same quantization type
+                    prev_offset == offset             # Same input dimension (avoid padding issues)
                 )
+
+                if can_merge:
+                    current_group.append((idx, start, end, offset))
+                    prev_end = end
+                else:
+                    if current_group:
+                        groups.append((current_group, prev_type))
+                    current_group = [(idx, start, end, offset)]
+                    prev_end = end
+                    prev_type = qweight_type
+                    prev_offset = offset
+
+            if current_group:
+                groups.append((current_group, prev_type))
+
+            # Execute grouped matmul
+            result = []
+            for group, type in groups:
+                g_start = group[0][1]
+                g_end = group[-1][2]
+                g_offset = group[0][3] # All offsets in group are identical
+                
+                # Slice the merged weight and ensure contiguous memory
+                w_slice = qweight[g_start:g_end, :g_offset].contiguous()
+                result.append(
+                    fused_mul_mat_gguf(x, w_slice, type)
+                )
+
             out = torch.cat(result, axis=1)
         else:
             qweight = layer.qweight
             qweight_type = layer.qweight_type.weight_type
             out = fused_mul_mat_gguf(x, qweight, qweight_type)
+
         if bias is not None:
             out.add_(bias)
         return out
