@@ -117,7 +117,6 @@ def _query_gcn_arch_from_amdsmi() -> str:
         # e.g., 'gfx942' for MI300X/MI325X
         target_gfx = asic_info.get("target_graphics_version", "")
         if target_gfx:
-            if target_gfx == "gfx9006": return "gfx906"  # gfx906: fix of amdsmi bug
             return target_gfx
     raise RuntimeError("amdsmi did not return valid GCN arch")
 
@@ -143,7 +142,7 @@ def _get_gcn_arch() -> str:
 # Resolve once at module load. Uses amdsmi (no CUDA init) so Ray workers
 # can still set CUDA_VISIBLE_DEVICES after import.
 # These are plain Python bools — fully torch.compile/Dynamo safe.
-_GCN_ARCH = _get_gcn_arch()
+_GCN_ARCH = "gfx906"
 
 _ON_GFX1X = any(arch in _GCN_ARCH for arch in ["gfx11", "gfx12"])
 _ON_MI3XX = any(arch in _GCN_ARCH for arch in ["gfx942", "gfx950"])
